@@ -17,6 +17,7 @@ Run with:
 
 import datetime as dt
 import io
+import re
 
 import pandas as pd
 import streamlit as st
@@ -29,26 +30,28 @@ ATT_PCT_COL = "Module attendance percentage (by session hours)"
 # ------------------------------------------------------------------
 # School mapping (same logic as the main SAA Data Pipeline app)
 # ------------------------------------------------------------------
-MANUAL_SCHOOL_MAPPING = {'1000467_1012234': 'AVS', '1000468_1012235': 'AVS', '1000874_1012233': 'ATS'}
 SCHOOL_ORDER = sorted(['AES', 'AMS', 'AVS', 'ATS']) + ['Others']
 
 
-def map_school(intake):
+def map_school(intake, namelist_school_lookup=None):
+    """AES/AVS/ATS/AMS prefix rule first; for non-standard intake numbers
+    (e.g. a numeric CAAS course ID), falls back to whatever School the
+    Course Report itself has for that intake — no hardcoded exception list."""
     if pd.isna(intake):
         return 'Others'
     intake = str(intake).strip()
-    if intake in MANUAL_SCHOOL_MAPPING:
-        return MANUAL_SCHOOL_MAPPING[intake]
     for prefix in ('AES', 'AVS', 'ATS', 'AMS'):
-        if intake.startswith(prefix):
+        if intake.upper().startswith(prefix):
             return prefix
+    if namelist_school_lookup:
+        return namelist_school_lookup.get(intake.upper(), 'Others')
     return 'Others'
 
 
 # ------------------------------------------------------------------
 # Page setup
 # ------------------------------------------------------------------
-st.set_page_config(page_title="SAA Data Discrepancy Checker", layout="wide")
+st.set_page_config(page_title="SAA Discrepancy Checker", layout="wide")
 
 # ------------------------------------------------------------------
 # Sidebar — file uploads & settings
@@ -80,14 +83,15 @@ The app automatically reads the **Name List format** sheet.
     )
 
     st.header("⚙️ Step 2 — Settings")
+    _today = dt.date.today()
     start_date = st.date_input(
         "Report start date",
-        value=dt.date(2026, 1, 1),
+        value=dt.date(_today.year, 1, 1),
         help="Only courses whose start date falls on or after this date are compared.",
     )
     end_date = st.date_input(
         "Report end date",
-        value=dt.date(2026, 4, 30),
+        value=_today,
         help="Only courses whose start date falls on or before this date are compared.",
     )
     min_attendance = st.number_input(
@@ -96,13 +100,16 @@ The app automatically reads the **Name List format** sheet.
     exclude_intakes_raw = st.text_area(
         "Intakes to exclude (comma-separated, optional)", value=""
     )
+    # Normalized the same way as "Course intake No." itself (see
+    # _normalize_intake_no) so an exclusion typed in a different case or
+    # spacing than the source file still matches correctly.
     exclude_intakes = [
-        x.strip() for x in exclude_intakes_raw.split(",") if x.strip()
+        re.sub(r'\s+', ' ', x.strip().upper()) for x in exclude_intakes_raw.split(",") if x.strip()
     ]
 
     run_button = st.button("Run discrepancy check", type="primary")
 
-st.title(f"📊 SAA Data Discrepancy Checker ({start_date:%d %b %Y} – {end_date:%d %b %Y})")
+st.title(f"📊 SAA Discrepancy Checker ({start_date:%d %b %Y} – {end_date:%d %b %Y})")
 st.caption("Upload the Attendance Report and the Namelist (Course Report). "
            "Results shown are limited to the discrepancy check for the "
            "selected date range and its summary, organised by School.")
@@ -111,6 +118,36 @@ st.caption("Upload the Attendance Report and the Namelist (Course Report). "
 # ------------------------------------------------------------------
 # Cleaning helpers (Steps 1-3 from the original pipeline)
 # ------------------------------------------------------------------
+def _safe_str_col(series: pd.Series) -> pd.Series:
+    """Coerces a column to string dtype safely before any .str accessor
+    call. Handles columns pandas/Excel inferred as numeric (e.g. an intake
+    number or ID stored as a pure number) or entirely blank (inferred as
+    float64 NaN) — both of which make .str.strip() etc. raise 'Can only use
+    .str accessor with string values!' otherwise. Real blanks/NaN are kept
+    as empty strings rather than turned into the literal text 'nan', and a
+    whole-number float (e.g. 260001.0, from a numeric-inferred ID column)
+    is converted to '260001' rather than '260001.0', so ID/intake-number
+    matching elsewhere in the app isn't silently corrupted."""
+    def _to_str(x):
+        if pd.isna(x):
+            return ''
+        if isinstance(x, float) and x.is_integer():
+            return str(int(x))
+        return str(x)
+    return series.apply(_to_str)
+
+
+def _normalize_intake_no(series: pd.Series) -> pd.Series:
+    """Normalizes 'Course intake No.' before it's used as a join key between
+    the Attendance and Course reports. Plain .str.strip() only removes
+    leading/trailing whitespace — it does NOT fix case differences (e.g.
+    'AES-1001' vs 'aes-1001') or internal double-spaces, either of which
+    makes pandas treat the same real intake as two different join keys,
+    causing every row to appear as a discrepancy even when the underlying
+    data actually matches. Collapses internal whitespace and uppercases."""
+    return series.str.strip().str.upper().str.replace(r'\s+', ' ', regex=True)
+
+
 def clean_attendance(df_attendance: pd.DataFrame, exclude_intakes: list) -> pd.DataFrame:
     df = df_attendance.copy()
 
@@ -123,9 +160,9 @@ def clean_attendance(df_attendance: pd.DataFrame, exclude_intakes: list) -> pd.D
         .astype(float)
     )
 
-    df["Learner name"] = df["Learner name"].str.strip().str.title()
-    df["Learner email address"] = df["Learner email address"].str.strip().str.lower()
-    df["Course intake No."] = df["Course intake No."].str.strip()
+    df["Learner name"] = _safe_str_col(df["Learner name"]).str.strip().str.title()
+    df["Learner email address"] = _safe_str_col(df["Learner email address"]).str.strip().str.lower()
+    df["Course intake No."] = _normalize_intake_no(_safe_str_col(df["Course intake No."]))
 
     # format="mixed" lets pandas infer the date format per-row instead of
     # locking onto one pattern from the first value — needed because these
@@ -158,13 +195,13 @@ def clean_course(df_course: pd.DataFrame, exclude_intakes: list) -> pd.DataFrame
             "Name": "Learner name",
             "Email Address": "Learner email address",
             "Organisation": "Company name",
-            "Fellowship/Sponsor": "Sponsorship status",
+            "Sponsor": "Sponsorship status",
         }
     ).copy()
 
-    df["Learner name"] = df["Learner name"].str.strip().str.title()
-    df["Learner email address"] = df["Learner email address"].str.strip().str.lower()
-    df["Course intake No."] = df["Course intake No."].str.strip()
+    df["Learner name"] = _safe_str_col(df["Learner name"]).str.strip().str.title()
+    df["Learner email address"] = _safe_str_col(df["Learner email address"]).str.strip().str.lower()
+    df["Course intake No."] = _normalize_intake_no(_safe_str_col(df["Course intake No."]))
 
     # Same mixed-format fix as clean_attendance above.
     df["Course start date"] = pd.to_datetime(
@@ -218,14 +255,22 @@ def run_pipeline(df_attendance_raw, df_course_raw, exclude_intakes, min_attendan
     start_ts = pd.Timestamp(start_date)
     end_ts = pd.Timestamp(end_date)
 
+    # A blank Course start date (common on real Course Report exports — see
+    # your AES-1001 sample) would otherwise make a row fail the date filter
+    # unconditionally, since NaT never satisfies >=/<= comparisons — silently
+    # dropping an otherwise-valid course from every comparison regardless of
+    # date range chosen. Falling back to Course end date when start is blank
+    # avoids that.
+    _attendance_filter_date = df_attendance_clean["Course start date"].fillna(df_attendance_clean["Course end date"])
     df_attendance_range = df_attendance_clean[
-        (df_attendance_clean["Course start date"] >= start_ts)
-        & (df_attendance_clean["Course start date"] <= end_ts)
+        (_attendance_filter_date >= start_ts)
+        & (_attendance_filter_date <= end_ts)
     ].reset_index(drop=True)
 
+    _course_filter_date = df_course_clean["Course start date"].fillna(df_course_clean["Course end date"])
     df_course_range = df_course_clean[
-        (df_course_clean["Course start date"] >= start_ts)
-        & (df_course_clean["Course start date"] <= end_ts)
+        (_course_filter_date >= start_ts)
+        & (_course_filter_date <= end_ts)
     ].reset_index(drop=True)
 
     df_attendance_filtered = df_attendance_range[
@@ -233,26 +278,33 @@ def run_pipeline(df_attendance_raw, df_course_raw, exclude_intakes, min_attendan
     ].copy().reset_index(drop=True)
 
     # Step 4: discrepancy check for the selected date range
+    #
+    # dropna=False is essential here — pandas groupby() silently DROPS every
+    # row where a grouping key is blank/NaN by default. Course Title (and,
+    # less commonly, Course name) is often blank on real exports, which
+    # would otherwise make entire courses vanish from this comparison
+    # without any error or warning — the row count would just quietly not
+    # match "Learners in Course Report" above, which is computed separately.
     attendance_count = (
-        df_attendance_filtered.groupby(["Course intake No.", "Course name"])["Learner name"]
+        df_attendance_filtered.groupby(["Course intake No.", "Course name"], dropna=False)["Learner name"]
         .count()
         .reset_index()
     )
     attendance_count.columns = [
         "Course Intake No.",
-        "Course Name (Learn@SAA Attendance Report)",
-        "Count in Learn@SAA Attendance Report",
+        "Course Name (Attendance)",
+        "Count in Attendance Report",
     ]
 
     course_count = (
-        df_course_range.groupby(["Course intake No.", "Course Title"])["Learner name"]
+        df_course_range.groupby(["Course intake No.", "Course Title"], dropna=False)["Learner name"]
         .count()
         .reset_index()
     )
     course_count.columns = [
         "Course Intake No.",
-        "Course Name (Course Reporting Excel Namelist)",
-        "Count in Course Reporting Excel Namelist",
+        "Course Name (Course Report)",
+        "Count in Course Report",
     ]
 
     df_comparison = attendance_count.merge(
@@ -265,20 +317,29 @@ def run_pipeline(df_attendance_raw, df_course_raw, exclude_intakes, min_attendan
     # (visible as "Serialization of dataframe to Arrow table was
     # unsuccessful..." warnings in the terminal) even though the app doesn't
     # crash. Fill counts with 0 and names with "" instead.
-    df_comparison["Course Name (Learn@SAA Attendance Report)"] = df_comparison["Course Name (Learn@SAA Attendance Report)"].fillna("")
-    df_comparison["Course Name (Course Reporting Excel Namelist)"] = df_comparison["Course Name (Course Reporting Excel Namelist)"].fillna("")
-    df_comparison["Count in Learn@SAA Attendance Report"] = df_comparison["Count in Learn@SAA Attendance Report"].fillna(0).astype(int)
-    df_comparison["Count in Course Reporting Excel Namelist"] = df_comparison["Count in Course Reporting Excel Namelist"].fillna(0).astype(int)
+    df_comparison["Course Name (Attendance)"] = df_comparison["Course Name (Attendance)"].fillna("")
+    df_comparison["Course Name (Course Report)"] = df_comparison["Course Name (Course Report)"].fillna("")
+    df_comparison["Count in Attendance Report"] = df_comparison["Count in Attendance Report"].fillna(0).astype(int)
+    df_comparison["Count in Course Report"] = df_comparison["Count in Course Report"].fillna(0).astype(int)
     df_comparison["Variance"] = (
-        df_comparison["Count in Learn@SAA Attendance Report"] - df_comparison["Count in Course Reporting Excel Namelist"]
+        df_comparison["Count in Attendance Report"] - df_comparison["Count in Course Report"]
     )
     df_comparison["Discrepancy"] = df_comparison["Variance"] != 0
 
-    # Organise by School — same mapping logic as the main SAA Data Pipeline app.
-    df_comparison["School"] = df_comparison["Course Intake No."].apply(map_school)
+    # Organise by School. Standard AES/AVS/ATS/AMS-prefixed intakes are
+    # mapped directly; anything else falls back to whatever School the
+    # Course Report itself already has for that intake, if it has a School
+    # column at all — no hardcoded exception list to maintain.
+    _namelist_school_lookup = {}
+    if "School" in df_course_clean.columns:
+        _nl_school = df_course_clean[["Course intake No.", "School"]].dropna(subset=["Course intake No."])
+        _namelist_school_lookup = dict(zip(_nl_school["Course intake No."], _nl_school["School"]))
+    df_comparison["School"] = df_comparison["Course Intake No."].apply(
+        lambda x: map_school(x, _namelist_school_lookup)
+    )
     df_comparison = df_comparison[
-        ["School", "Course Intake No.", "Course Name (Learn@SAA Attendance Report)", "Count in Learn@SAA Attendance Report",
-         "Course Name (Course Reporting Excel Namelist)", "Count in Course Reporting Excel Namelist", "Variance", "Discrepancy"]
+        ["School", "Course Intake No.", "Course Name (Attendance)", "Count in Attendance Report",
+         "Course Name (Course Report)", "Count in Course Report", "Variance", "Discrepancy"]
     ]
 
     df_discrepancy = df_comparison[df_comparison["Discrepancy"]].reset_index(drop=True)
@@ -367,8 +428,8 @@ def build_styled_workbook(df_discrepancy, school_summary, summary, date_label):
     ws_summary.title = "Summary"
     summary_rows = [
         [f"Total intakes ({date_label})", summary["total_intakes"]],
-        ["Course Intakes with Discrepancy", summary["total_intakes_with_discrepancy"]],
-        ["Total No. of Rows with Discrepancy", int(summary["sum_abs_variance"])],
+        ["Intakes with discrepancy", summary["total_intakes_with_discrepancy"]],
+        ["Sum of absolute variance", int(summary["sum_abs_variance"])],
         [f"Learners in Attendance Report ({date_label})", summary["learners_range_attendance"]],
         [f"Learners in Course Report ({date_label})", summary["learners_range_course"]],
     ]
@@ -456,6 +517,16 @@ if run_button:
         st.error(f"Attendance file is missing expected columns: {sorted(missing_att)}")
         st.stop()
 
+    required_course_cols = {"Course Intake Number", "Course Title", "Name",
+                             "Email Address", "Course Start Date", "Course End Date"}
+    missing_course = required_course_cols - set(df_course_raw.columns)
+    if missing_course:
+        st.error(
+            f"Course Report (sheet '{target_sheet}') is missing expected columns: {sorted(missing_course)}.\n\n"
+            f"Columns found: {sorted(df_course_raw.columns)}"
+        )
+        st.stop()
+
     if start_date > end_date:
         st.error("Start date must be on or before the end date.")
         st.stop()
@@ -491,17 +562,17 @@ if run_button:
     st.header("Summary")
     s1, s2, s3 = st.columns(3)
     s1.metric(f"Total intakes ({date_label})", summary["total_intakes"])
-    s2.metric("Course Intakes with Discrepancy", summary["total_intakes_with_discrepancy"])
+    s2.metric("Intakes with discrepancy", summary["total_intakes_with_discrepancy"])
     _pct_discrepancy = (
         summary["total_intakes_with_discrepancy"] / summary["total_intakes"] * 100
         if summary["total_intakes"] else 0
     )
     s2.markdown(
-        f'<div style="margin-top:-14px; color:#FF0000; font-size:0.85rem;">'
+        f'<div style="margin-top:-14px; color:#FF0000; font-weight:700; font-size:0.85rem;">'
         f'{_pct_discrepancy:.1f}% of total intakes</div>',
         unsafe_allow_html=True,
     )
-    s3.metric("Total No. of Rows with Discrepancy", int(summary["sum_abs_variance"]))
+    s3.metric("Sum of absolute variance", int(summary["sum_abs_variance"]))
 
     c1, c2 = st.columns(2)
     c1.metric(f"Learners in Attendance Report ({date_label})", summary["learners_range_attendance"])
