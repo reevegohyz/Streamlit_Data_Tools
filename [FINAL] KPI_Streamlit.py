@@ -40,9 +40,10 @@ st.caption("Upload your 5 exported files, set your reporting period, and click R
 # ────────────────────────────────────────────────────────────────
 # CLASSIFICATION REFERENCE FILE UPLOADS (optional — override built-in defaults)
 # ────────────────────────────────────────────────────────────────
-# These two are separate from the 5 reporting files below — they replace the
-# classification data used to compute segments (Local/CAAS/International) and
-# senior designations, instead of relying on what's hardcoded in this script.
+# These three are separate from the 5 reporting files below — they replace
+# the reference data used to compute segments (Local/CAAS/International),
+# senior designations, and public-holiday-aware trainee-day counts, instead
+# of relying on what's hardcoded in this script.
 # Declared here, early, so an upload takes effect immediately — including in
 # the "Manage Organization Name Classifications" editor further down, which
 # would otherwise show stale data for one extra rerun after a fresh upload.
@@ -50,7 +51,8 @@ st.sidebar.header("🗂️ Classification Reference Files")
 st.sidebar.caption(
     "These are no longer hardcoded in this script. Organisation Classification can also be built up "
     "manually in the on-page editor further down (and saved locally). Director Designation "
-    "Classification has no built-in fallback at all — without an upload here, KPI 2 will read 0."
+    "Classification and Singapore Public Holidays have no built-in fallback at all — without an "
+    "upload here, KPI 2 will read 0, and trainee-day counts won't exclude any public holidays."
 )
 
 uploaded_org_class_file = st.sidebar.file_uploader(
@@ -65,6 +67,12 @@ uploaded_designation_file = st.sidebar.file_uploader(
     "Director Designation Classification List (.xlsx or .csv) — required for KPI 2", type=["xlsx", "csv"], key="designation_upload"
 )
 st.sidebar.caption("Required columns: **Designation**, **Category** (Private Sector / Public Sector).")
+
+uploaded_holidays_file = st.sidebar.file_uploader(
+    "Singapore Public Holidays List (.xlsx or .csv) — affects trainee-day accuracy", type=["xlsx", "csv"], key="holidays_upload"
+)
+st.sidebar.caption("Required column: **Date**. Update and re-upload this file annually — a stale or missing "
+                    "list will silently under-count trainee days for courses spanning a real public holiday.")
 
 st.sidebar.divider()
 
@@ -291,7 +299,6 @@ Report → Progress and timetabling → Attendance & session information report 
 **Certificate List**
 Report → Progress and timetabling → Assessment and graduation → Course & module certificate report → Module Certificate
 *Example file name: `Module_Certificate_Report_20260709153714`*
-*Either the standard Learn@SAA module certificate export or the Russel test/working format is accepted.*
 
 **Course Reporting Namelist**
 Download the Excel workbook from SharePoint and upload it as-is — no need to delete other sheets.
@@ -310,7 +317,7 @@ uploaded_attendance = st.sidebar.file_uploader("Attendance List (.xlsx)", type="
 st.sidebar.caption("e.g. Attendance_Information_Report_20260526110649.xlsx")
 
 uploaded_cert = st.sidebar.file_uploader("Certificate List (.xlsx)", type="xlsx")
-st.sidebar.caption("Standard Learn@SAA export (e.g. Module_Certificate_Report_20260626143252) or Russel's Consolidated Certificate List — both accepted.")
+st.sidebar.caption("e.g. Module_Certificate_Report_20260626143252.xlsx (standard Learn@SAA export)")
 
 uploaded_namelist = st.sidebar.file_uploader("Course Reporting Namelist workbook (.xlsx)", type="xlsx")
 st.sidebar.caption("e.g. Course Reporting and Evaluation_NEW.xlsx (full SharePoint workbook)")
@@ -322,8 +329,9 @@ st.sidebar.caption("💡 Org Name Classification and Senior Designations can be 
 st.sidebar.divider()
 st.sidebar.header("⚙️ Step 2 — Settings")
 
-start_date = st.sidebar.date_input("Report start date", value=pd.Timestamp('2026-01-01'))
-end_date = st.sidebar.date_input("Report end date", value=pd.Timestamp('2026-04-30'))
+_today = datetime.date.today()
+start_date = st.sidebar.date_input("Report start date", value=datetime.date(_today.year, 1, 1))
+end_date = st.sidebar.date_input("Report end date", value=_today)
 
 attendance_threshold = st.sidebar.slider("Minimum attendance % (by session)", 0, 100, 80)
 
@@ -423,56 +431,39 @@ def load_namelist_workbook(file, expected_cols):
     return df, target_sheet
 
 
-# ---- Certificate dual-format loader ----
+# ---- Certificate loader (standard Learn@SAA export only) ----
 CERT_FORMAT_A_COLS = [
     "Learner name", "Learner ID", "Branch", "School", "Course code", "Course name",
     "Course intake No.", "Enrollment status", "Withhold status", "Payment status",
     "Certificate name", "Certificate status", "Generation date",
     "Certificate serial No.", "Certificate number",
 ]
-CERT_FORMAT_B_COLS = [
-    "Generation date", "Learner name", "Learner ID", "School", "Course code",
-    "Course name", "Course intake No.", "Certificate name", "Certificate status",
-    "Certificate serial No.", "Certificate number", "Learner ID Type",
-    "Email Address", "Organisation", "Country", "Course Start Date", "Course End Date",
-]
-CERT_SHARED_SCHEMA = [
-    "Learner name", "Learner ID", "Course intake No.", "Course code", "School",
-    "Certificate name", "Certificate status", "Generation date",
-    "Certificate serial No.", "Certificate number", "Email Address",
-]
 
 
 def load_certificate_file(file):
-    """Loads either the standard Learn@SAA module certificate export (Format A)
-    or the Russel test/working format (Format B) and normalizes both into a
-    single shared schema."""
+    """Loads the standard Learn@SAA module certificate export."""
     try:
         raw = pd.read_excel(file, header=0)
     except Exception as e:
         st.error(f"❌ Could not read **Certificate List**: {e}")
         st.stop()
 
-    cols = set(raw.columns)
-    is_format_b = "Organisation" in cols or "Email Address" in cols or "Course End Date" in cols
-    fmt_label = "Format B (Russel / working format)" if is_format_b else "Format A (standard Learn@SAA export)"
-
     required_min = ["Learner name", "Course intake No.", "Certificate status"]
     missing = [c for c in required_min if c not in raw.columns]
     if missing:
         st.error(
-            f"❌ **Certificate List** is missing expected column(s): {', '.join(missing)}. "
-            f"This doesn't match either supported certificate format."
+            f"❌ **Certificate List** is missing expected column(s): {', '.join(missing)}."
         )
         st.stop()
 
     df = raw.copy()
-    for col in CERT_SHARED_SCHEMA:
-        if col not in df.columns:
-            df[col] = pd.NA
+    # 'Email Address' isn't part of the standard export, but is used
+    # downstream as a dedup fallback key when Learner ID is missing — kept
+    # as an always-present (blank) column so that logic doesn't break.
+    if "Email Address" not in df.columns:
+        df["Email Address"] = pd.NA
 
-    df = df[CERT_SHARED_SCHEMA + [c for c in df.columns if c not in CERT_SHARED_SCHEMA]]
-    return df, fmt_label
+    return df, "Standard Learn@SAA export"
 
 
 # ────────────────────────────────────────────────────────────────
@@ -585,7 +576,7 @@ with st.spinner("Running pipeline..."):
     # ============================================================
     # BLOCK 1.1: Date Filter (Admitted / Enrollment / Attendance)
     # Certificate rows are filtered later by intake membership, not by date,
-    # since Format A has no Course Start/End Date columns.
+    # since the standard Certificate export has no Course Start/End Date columns.
     # ============================================================
     def step_date_filter():
         df_admitted['Course end date'] = pd.to_datetime(df_admitted['Course end date'], dayfirst=True, errors='coerce')
@@ -676,13 +667,43 @@ with st.spinner("Running pipeline..."):
     # ============================================================
     # SHARED HELPERS
     # ============================================================
-    SG_HOLIDAYS_DEFAULT = [
-        '2026-01-01', '2026-02-17', '2026-02-18', '2026-03-21', '2026-04-03',
-        '2026-05-01', '2026-05-27', '2026-05-31', '2026-06-01', '2026-08-09',
-        '2026-08-10', '2026-11-08', '2026-11-09', '2026-12-25',
-    ]
-    sg_public_holidays = pd.to_datetime(SG_HOLIDAYS_DEFAULT)
-    sg_holidays_np = np.array([d.strftime('%Y-%m-%d') for d in sg_public_holidays], dtype='datetime64[D]')
+    def _load_public_holidays():
+        """Singapore Public Holidays is no longer hardcoded in this script —
+        it comes entirely from the uploaded Singapore Public Holidays List.
+        Without a valid upload, trainee-day calculations proceed with NO
+        holidays excluded (a pure business-day count), which will slightly
+        UNDER-count trainee days for any course that spans a real public
+        holiday — a silent accuracy risk, not a crash, so it's flagged here."""
+        if uploaded_holidays_file is not None:
+            try:
+                _hol_df = _read_classification_upload(uploaded_holidays_file, header_keywords=["date"])
+            except Exception as e:
+                st.warning(f"⚠️ Could not read Singapore Public Holidays List ({e}) — "
+                           "trainee-day calculations will proceed with NO public holidays excluded.")
+                return np.array([], dtype='datetime64[D]'), "no data (upload failed)"
+
+            _date_col = _find_col(_hol_df, ["date"])
+            if _date_col is None:
+                st.warning(
+                    f"⚠️ Singapore Public Holidays List is missing a 'Date' column — "
+                    f"columns found: {', '.join(str(c) for c in _hol_df.columns)}. "
+                    "Trainee-day calculations will proceed with NO public holidays excluded."
+                )
+                return np.array([], dtype='datetime64[D]'), "no data (upload invalid)"
+
+            _parsed_dates = pd.to_datetime(_hol_df[_date_col], dayfirst=True, errors='coerce').dropna()
+            _n_bad = len(_hol_df) - len(_parsed_dates)
+            if _n_bad > 0:
+                st.warning(f"⚠️ {_n_bad} row(s) in the Singapore Public Holidays List had an unparseable Date and were skipped.")
+            _holidays_np = np.array([d.strftime('%Y-%m-%d') for d in _parsed_dates], dtype='datetime64[D]')
+            return _holidays_np, f"uploaded file ({uploaded_holidays_file.name}, {len(_holidays_np):,} dates)"
+
+        st.warning("⚠️ No Singapore Public Holidays List uploaded — trainee-day calculations will proceed "
+                   "with NO public holidays excluded (a pure business-day count), which will slightly "
+                   "under-count trainee days for any course spanning a real public holiday.")
+        return np.array([], dtype='datetime64[D]'), "no data — upload a Singapore Public Holidays List"
+
+    sg_holidays_np, public_holidays_source = _load_public_holidays()
 
     def calculate_course_duration(start, end):
         if pd.isna(start) or pd.isna(end):
@@ -692,43 +713,46 @@ with st.spinner("Running pipeline..."):
         else:
             return np.busday_count(start.date(), (end + pd.Timedelta(days=1)).date(), holidays=sg_holidays_np)
 
-    EMAIL_DOMAIN_MAP = {
-        '.bn': 'SINGAPORE', '.sn': 'SENEGAL', 'inac.st': 'SAO TOME & PRINCIPE',
-        'caa.co.zm': 'ZAMBIA', 'co.zm': 'ZAMBIA', 'yahoo.fr': 'FRANCE',
-        'com.sg': 'SINGAPORE', 'gov.sg': 'SINGAPORE', 'defence.gov.sg': 'SINGAPORE',
-    }
-    COMPANY_COUNTRY_MAP = {
-        'republic of singapore navy': 'SINGAPORE',
-        'changi airport group (singapore) pte. ltd.': 'SINGAPORE',
-        'caas in-region training': 'INTERNATIONAL',
-        'technocrete pte ltd': 'SINGAPORE',
-        'lam chuan construction pte ltd': 'SINGAPORE',
-        'zhengda corporation pte. ltd.': 'SINGAPORE',
-    }
+    def _find_namelist_col(candidates, cols):
+        cols_lower = {c.lower().strip(): c for c in cols}
+        for cand in candidates:
+            if cand in cols_lower:
+                return cols_lower[cand]
+        return None
 
-    # Forces the correct country for specific organizations whose Country of
-    # Organisation was entered incorrectly in the source admitted/attendance
-    # file (e.g. a data-entry error listing the learner's home country
-    # instead of the organization's country), overriding whatever the source
-    # file says for these exact organization names.
-    ORG_NAME_COUNTRY_OVERRIDE = {
-        'Others (CAAS-ESAF)': 'SINGAPORE',
-        'Others (HSL Ground engineering Pte Ltd)': 'SINGAPORE',
-        'Others (WAH LOON ENGINEERING PTE LTD)': 'SINGAPORE',
-        'Others (hsl ground engineering pte ltd)': 'SINGAPORE',
-    }
+    def _build_namelist_school_lookup():
+        """Builds an intake-number -> School lookup from the Course Reporting
+        Namelist, used only as a fallback for intake numbers that don't match
+        the standard AES/AVS/ATS/AMS prefix pattern — replaces what used to
+        be a hardcoded 3-entry MANUAL_SCHOOL_MAPPING for known exceptions.
+        Degrades gracefully: returns an empty lookup (non-standard intakes
+        fall through to 'Others', same as before) if the Namelist doesn't
+        have a recognisable School column."""
+        school_col = _find_namelist_col(['school'], df_namelist.columns)
+        intake_col = _find_namelist_col(['course intake number', 'course intake no.'], df_namelist.columns)
+        if school_col is None or intake_col is None:
+            return {}, "No 'School' column found in the Course Reporting Namelist — non-standard intake numbers will show as 'Others'."
+        nl = df_namelist[[intake_col, school_col]].dropna(subset=[intake_col]).copy()
+        nl['_key'] = nl[intake_col].astype(str).str.strip().str.upper()
+        nl = nl.drop_duplicates(subset='_key', keep='first')
+        lookup = dict(zip(nl['_key'], nl[school_col].astype(str).str.strip()))
+        return lookup, f"Loaded {len(lookup):,} intake-to-School mappings from the Course Reporting Namelist ('{school_col}' column) as a fallback for non-standard intake numbers."
 
-    MANUAL_SCHOOL_MAPPING = {'1000467_1012234': 'AVS', '1000468_1012235': 'AVS', '1000874_1012233': 'ATS'}
+    NAMELIST_SCHOOL_LOOKUP, namelist_school_source_note = _build_namelist_school_lookup()
 
     def map_school(intake):
         if pd.isna(intake):
             return 'Others'
         intake = str(intake).strip()
-        if intake in MANUAL_SCHOOL_MAPPING:
-            return MANUAL_SCHOOL_MAPPING[intake]
         for prefix in ('AES', 'AVS', 'ATS', 'AMS'):
-            if intake.startswith(prefix):
+            if intake.upper().startswith(prefix):
                 return prefix
+        # Non-standard intake number format (e.g. a numeric CAAS course ID
+        # instead of the usual school-prefixed code) — check the Namelist
+        # before giving up and calling it 'Others'.
+        key = intake.upper()
+        if key in NAMELIST_SCHOOL_LOOKUP:
+            return NAMELIST_SCHOOL_LOOKUP[key]
         return 'Others'
 
     CAAS_NAMES = ['civil aviation authority of singapore']
@@ -746,45 +770,11 @@ with st.spinner("Running pipeline..."):
             return 'CAAS'
         return 'Local'
 
-    # ---- Organization-name classifier (curated table + heuristic fallback) ----
-    SG_NAME_PATTERNS = [
-        r'\bpte\.?\s*ltd\.?\b', r'\bsingapore\b', r'\bsia engineering\b',
-        r'\bst engineering\b', r'\bchangi airport\b', r'\brepublic of singapore navy\b',
-    ]
-    CAAS_NAME_PATTERNS = [r'\bcivil aviation authority of singapore\b', r'\bcaas\b']
-    COUNTRY_HINTS = [
-        'thailand', 'vietnam', 'congo', 'malaysia', 'nigeria', 'macau', 'brunei', 'hong kong',
-        'namibia', 'oman', 'fiji', 'korea', 'rwanda', 'togo', 'philippines', 'indonesia',
-        'myanmar', 'cambodia', 'laos', 'india', 'pakistan', 'bangladesh', 'sri lanka', 'nepal',
-        'china', 'japan', 'mongolia', 'kazakhstan', 'uzbekistan', 'tajikistan', 'kyrgyzstan',
-        'turkmenistan', 'azerbaijan', 'armenia', 'georgia', 'russia', 'ukraine', 'poland',
-        'germany', 'france', 'united kingdom', 'united states', 'canada', 'australia',
-        'new zealand', 'papua new guinea', 'samoa', 'tonga', 'solomon islands', 'vanuatu',
-        'kiribati', 'timor-leste', 'brazil', 'argentina', 'mexico', 'colombia', 'peru', 'chile',
-        'egypt', 'kenya', 'tanzania', 'uganda', 'ethiopia', 'ghana', 'south africa', 'morocco',
-        'algeria', 'tunisia', 'libya', 'sudan', 'zambia', 'zimbabwe', 'botswana', 'mozambique',
-        'madagascar', 'senegal', 'mali', 'niger', 'chad', 'cameroon', 'gabon', 'angola',
-        'saudi arabia', 'united arab emirates', 'qatar', 'kuwait', 'bahrain', 'jordan',
-        'lebanon', 'iraq', 'iran', 'yemen', 'turkey', 'italy', 'spain', 'portugal',
-        'netherlands', 'belgium', 'switzerland', 'austria', 'sweden', 'norway', 'denmark',
-        'finland', 'greece', 'cyprus', 'malta', 'ireland', 'mauritius', 'seychelles',
-        'maldives', 'bhutan', 'taiwan', 'south korea',
-    ]
-
+    # ---- Organization-name classifier (curated table only — no heuristic
+    # fallback. Anything not in the uploaded Organisation Classification
+    # table is Unknown, flagged for review, rather than silently guessed.) ----
     def _norm_org_key(name):
         return re.sub(r'\s+', ' ', str(name).strip()).upper()
-
-    def heuristic_classify_org(key_upper):
-        for pat in CAAS_NAME_PATTERNS:
-            if re.search(pat, key_upper, re.IGNORECASE):
-                return 'CAAS', True, 'heuristic', 'heuristic match: CAAS-related name'
-        for pat in SG_NAME_PATTERNS:
-            if re.search(pat, key_upper, re.IGNORECASE):
-                return 'Local', True, 'heuristic', 'heuristic match: Singapore-style pattern'
-        for country in COUNTRY_HINTS:
-            if country.upper() in key_upper:
-                return 'International', True, 'heuristic', f"heuristic match: country hint '{country}'"
-        return 'International', True, 'heuristic', 'heuristic default: no SG signal, no country hint (low-confidence)'
 
     def classify_org_name(name, lookup_dict):
         if pd.isna(name) or str(name).strip() == '':
@@ -793,7 +783,7 @@ with st.spinner("Running pipeline..."):
         if key in lookup_dict:
             cls, needs_review = lookup_dict[key]
             return cls, bool(needs_review), 'table', 'matched curated classification table'
-        return heuristic_classify_org(key)
+        return 'Unknown', True, 'none', 'not found in Organisation Classification table — needs to be added'
 
     def get_admitted_org_column(df_admitted_clean):
         candidates = ['organization name', 'organisation name', 'organization', 'organisation',
@@ -820,10 +810,6 @@ with st.spinner("Running pipeline..."):
             df['Organization Name'] = df['Company name']
         else:
             df['Organization Name'] = ''
-
-        if 'Country of Organisation' in df.columns:
-            override_mask = df['Organization Name'].isin(ORG_NAME_COUNTRY_OVERRIDE)
-            df.loc[override_mask, 'Country of Organisation'] = df.loc[override_mask, 'Organization Name'].map(ORG_NAME_COUNTRY_OVERRIDE)
 
         results = df['Organization Name'].apply(lambda x: classify_org_name(x, lookup_dict))
         df['Segment (Org Name)'] = results.apply(lambda r: r[0])
@@ -852,25 +838,6 @@ with st.spinner("Running pipeline..."):
             .rename(columns={'Country/Region of organization': 'Country of Organisation'})
         merged = merged.loc[:, ~merged.columns.duplicated()]
         merged['Country of Organisation'] = merged['Country of Organisation'].str.strip().str.upper()
-
-        def fill_email(row):
-            if pd.notna(row['Country of Organisation']) and row['Country of Organisation'] != '':
-                return row['Country of Organisation']
-            email = str(row['Learner email address']).strip().lower()
-            for domain, country in EMAIL_DOMAIN_MAP.items():
-                if email.endswith(domain):
-                    return country
-            return row['Country of Organisation']
-
-        merged['Country of Organisation'] = merged.apply(fill_email, axis=1)
-
-        def fill_company(row):
-            if pd.notna(row['Country of Organisation']) and row['Country of Organisation'] != '':
-                return row['Country of Organisation']
-            company = str(row.get('Company name', '')).strip().lower()
-            return COMPANY_COUNTRY_MAP.get(company, row['Country of Organisation'])
-
-        merged['Country of Organisation'] = merged.apply(fill_company, axis=1)
         return merged
 
     def step_designation(df_att, df_admitted_clean):
@@ -1325,13 +1292,6 @@ with st.spinner("Running pipeline..."):
     # ============================================================
     # BLOCK 5.5: Non-Course Events Check
     # ============================================================
-    def _find_namelist_col(candidates, cols):
-        cols_lower = {c.lower().strip(): c for c in cols}
-        for cand in candidates:
-            if cand in cols_lower:
-                return cols_lower[cand]
-        return None
-
     def step_non_course_events():
         target = ['CAS-0001', 'AMS-0001', 'AMS-0002']
         df_check = df_namelist[df_namelist['Course Intake Number'].isin(target)].copy()
@@ -1799,6 +1759,7 @@ with tab_dq:
 
     # 6.5 School mapping
     st.subheader("School Mapping")
+    st.caption(f"ℹ️ {namelist_school_source_note}")
     school_order = sorted(['AES', 'AMS', 'AVS', 'ATS']) + ['Others']
     school_counts = df_attendance_clean['School'].value_counts().reindex(school_order).fillna(0).astype(int).reset_index()
     school_counts.columns = ['School', 'Trainee Count']
@@ -1828,7 +1789,26 @@ with tab_reference:
     else:
         org_by_country = pd.DataFrame(columns=['Organization Name', 'Country of Organisation', 'Classification'])
 
+    # If the org's entry in the classification list itself has no country
+    # asserted (blank, or the column doesn't exist at all in the upload),
+    # there's nothing to check against — skip flagging entirely rather than
+    # inferring an "expected" country purely from Classification.
+    _org_class_country_col = 'Country/Region of Organization'
+    if _org_class_country_col in org_class_table_raw.columns:
+        _blank_country_keys = set(
+            org_class_table_raw.loc[
+                org_class_table_raw[_org_class_country_col].isna()
+                | (org_class_table_raw[_org_class_country_col].astype(str).str.strip() == ''),
+                '_key'
+            ]
+        )
+    else:
+        _blank_country_keys = set(org_class_table_raw['_key']) if len(org_class_table_raw) > 0 else set()
+
     def _country_check(row):
+        org_key = re.sub(r'\s+', ' ', str(row.get('Organization Name', '')).strip()).upper()
+        if org_key in _blank_country_keys:
+            return '⬜ Not checked (no country on classification list)'
         country = str(row.get('Country of Organisation', '')).strip().upper()
         cls = row.get('Classification', '')
         if country in ('', 'NAN', 'NONE'):
@@ -1869,6 +1849,18 @@ with tab_reference:
     st.caption(f"Source: **{designation_source}**")
     senior_df = pd.DataFrame(sorted(SENIOR_DESIGNATIONS), columns=['Designation'])
     st.dataframe(senior_df, use_container_width=True)
+
+    st.divider()
+
+    st.subheader("Singapore Public Holidays (used for trainee-day calculations)")
+    st.caption(f"Source: **{public_holidays_source}**")
+    if len(sg_holidays_np) > 0:
+        holidays_df = pd.DataFrame(sorted(sg_holidays_np.astype(str)), columns=['Date'])
+        st.dataframe(holidays_df, use_container_width=True)
+    else:
+        st.warning("⚠️ No public holidays loaded — trainee-day counts currently exclude weekends only, "
+                   "not public holidays. This will under-count trainee days for any course spanning a "
+                   "real Singapore public holiday.")
 
 
 # ── Course Reporting Namelist CROSS-CHECK TAB ────────────────────────────────────
